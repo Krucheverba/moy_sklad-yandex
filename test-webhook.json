@@ -1,0 +1,12 @@
+{
+  "type": "ORDER_CREATED",
+  "order": {
+    "id": "TEST-12345",
+    "items": [
+      {
+        "offerId": "1-IxiodciXeIaS5RgRrkC1",
+        "count": 2
+      }
+    ]
+  }
+}
