@@ -272,7 +272,10 @@ app.post('/webhook', async (req, res) => {
       console.log(`[ORDER_STATUS_UPDATED] Processing order: orderId="${externalNumber}", newStatus="${newStatus}"`);
 
       // Статусы, которые триггерят создание Отгрузки
-      const triggerStatuses = ['READY_TO_SHIP', 'DELIVERY', 'PROCESSING'];
+      // PROCESSING - Заказ в обработке (можно начинать сборку)
+      // DELIVERY - Заказ передан в доставку (готов к отгрузке)
+      // PICKUP - Заказ готов к выдаче (для самовывоза)
+      const triggerStatuses = ['PROCESSING', 'DELIVERY', 'PICKUP'];
 
       if (triggerStatuses.includes(newStatus)) {
         const result = await handleLabelPrint(event, externalNumber);
@@ -321,6 +324,116 @@ app.get('/webhook', (req, res) => {
     message: 'Webhook endpoint is ready',
     version: '1.0.0'
   });
+});
+
+// Яндекс требует endpoint /notification для проверки интеграции
+// GET endpoint для /notification (Яндекс проверяет доступность)
+app.get('/notification', (req, res) => {
+  console.log('[NOTIFICATION] GET request received from Yandex verification');
+  res.status(200).json({
+    version: '1.0.0',
+    name: 'Yandex-MoySklad Integration',
+    time: new Date().toISOString()
+  });
+});
+
+// POST endpoint для /notification (основной endpoint для webhook от Яндекса)
+app.post('/notification', async (req, res) => {
+  const startTime = new Date().toISOString();
+  let notificationType = null;
+  let orderId = null;
+  
+  try {
+    // Validate request body exists
+    if (!req.body || typeof req.body !== 'object') {
+      console.error('[NOTIFICATION] Invalid request body: body is missing or not an object');
+      return res.status(400).json({ error: 'Invalid request body' });
+    }
+
+    const event = req.body;
+    notificationType = event.notificationType;
+    orderId = event.orderId;
+    
+    // Log webhook receipt
+    console.log(`[NOTIFICATION] Received notification: type="${notificationType}", orderId="${orderId || 'N/A'}"`);
+    console.log(`[NOTIFICATION] Full payload:`, JSON.stringify(event, null, 2));
+
+    // Handle PING notification (проверка работоспособности)
+    if (notificationType === 'PING') {
+      console.log('[NOTIFICATION] PING received - responding with integration info');
+      return res.status(200).json({
+        version: '1.0.0',
+        name: 'Yandex-MoySklad Integration',
+        time: startTime
+      });
+    }
+
+    // Handle ORDER_CREATED event
+    if (notificationType === 'ORDER_CREATED') {
+      const externalNumber = `YM-${orderId}`;
+      const result = await handleOrderCreated(event, externalNumber);
+      
+      // Яндекс требует ответ 200 OK с JSON
+      return res.status(200).json({
+        version: '1.0.0',
+        name: 'Yandex-MoySklad Integration',
+        time: startTime,
+        status: 'processed',
+        orderId: orderId
+      });
+    }
+
+    // Handle ORDER_STATUS_UPDATED event
+    if (notificationType === 'ORDER_STATUS_UPDATED') {
+      const externalNumber = `YM-${orderId}`;
+      const newStatus = event.status || event.newStatus;
+      
+      console.log(`[NOTIFICATION] ORDER_STATUS_UPDATED: orderId="${externalNumber}", newStatus="${newStatus}"`);
+
+      // Статусы, которые триггерят создание Отгрузки
+      // PROCESSING - Заказ в обработке (можно начинать сборку)
+      // DELIVERY - Заказ передан в доставку (готов к отгрузке)
+      // PICKUP - Заказ готов к выдаче (для самовывоза)
+      const triggerStatuses = ['PROCESSING', 'DELIVERY', 'PICKUP'];
+
+      if (triggerStatuses.includes(newStatus)) {
+        const result = await handleLabelPrint(event, externalNumber);
+      } else {
+        console.log(`[NOTIFICATION] Status ignored: orderId="${externalNumber}", status="${newStatus}"`);
+      }
+
+      return res.status(200).json({
+        version: '1.0.0',
+        name: 'Yandex-MoySklad Integration',
+        time: startTime,
+        status: 'processed',
+        orderId: orderId
+      });
+    }
+
+    // Прочие события — просто подтверждаем получение
+    console.log(`[NOTIFICATION] Event type not handled: type="${notificationType}"`);
+    return res.status(200).json({
+      version: '1.0.0',
+      name: 'Yandex-MoySklad Integration',
+      time: startTime,
+      status: 'received'
+    });
+    
+  } catch (err) {
+    // Log error with full context
+    console.error(`[NOTIFICATION] System error: notificationType="${notificationType}", orderId="${orderId}", error="${err.message}"`);
+    if (err.stack) console.error(err.stack);
+    
+    // Всё равно возвращаем 200, чтобы Яндекс не повторял запрос
+    return res.status(200).json({
+      version: '1.0.0',
+      name: 'Yandex-MoySklad Integration',
+      time: startTime,
+      status: 'error',
+      error: err.message
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
