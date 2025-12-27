@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+const axios = require('axios');
 const { createCustomerOrder, createDemand, findCustomerOrderByExternalNumber, findDemandByExternalNumber } = require('./moysklad');
 const mapping = require('./mapping.json');
 
@@ -65,6 +66,10 @@ app.use((req, res, next) => {
 const STORE_ID = process.env.STORE_ID;
 const ORG_ID = process.env.ORG_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+
+// In-memory cache для хранения items между вебхуками
+// Яндекс не передаёт items в ORDER_STATUS_UPDATED, поэтому сохраняем их из ORDER_CREATED
+const orderItemsCache = new Map();
 
 // Verify webhook signature using HMAC-SHA256
 function verifyWebhook(req) {
@@ -143,33 +148,59 @@ function mapPositionsFromYandex(yandexNotification) {
   return positions;
 }
 
-// Handle ORDER_CREATED event - create Customer Order (reservation)
+// Handle ORDER_CREATED event - save items to cache
 async function handleOrderCreated(notification, externalNumber) {
   console.log(`[ORDER_CREATED] Processing order: orderId="${externalNumber}"`);
   console.log(`[ORDER_CREATED] Campaign ID: ${notification.campaignId}, Created at: ${notification.createdAt}`);
+  
+  // Сохраняем items в кэш для последующего использования
+  // Яндекс не передаёт items в ORDER_STATUS_UPDATED, поэтому сохраняем их здесь
+  if (notification.items && Array.isArray(notification.items)) {
+    orderItemsCache.set(externalNumber, notification.items);
+    console.log(`[ORDER_CREATED] Saved ${notification.items.length} items to cache: orderId="${externalNumber}"`);
+  } else {
+    console.warn(`[ORDER_CREATED] No items in notification: orderId="${externalNumber}"`);
+  }
+  
+  console.log(`[ORDER_CREATED] Order registered, waiting for PROCESSING status: orderId="${externalNumber}"`);
+  return { status: 200, message: 'items_cached' };
+}
+
+// Handle PROCESSING status - create Customer Order (reserve)
+async function handleProcessing(notification, externalNumber) {
+  console.log(`[PROCESSING] Processing order: orderId="${externalNumber}"`);
   
   // Check if Customer Order already exists (idempotency)
   try {
     const existingOrder = await findCustomerOrderByExternalNumber(externalNumber);
     if (existingOrder) {
-      console.log(`[ORDER_CREATED] Customer Order already exists: orderId="${externalNumber}", skipping creation`);
+      console.log(`[PROCESSING] Customer Order already exists: orderId="${externalNumber}", skipping creation`);
       return { status: 200, message: 'already exists' };
     }
   } catch (err) {
-    console.error(`[ORDER_CREATED] Error checking existing Customer Order: orderId="${externalNumber}", error="${err.message}"`);
+    console.error(`[PROCESSING] Error checking existing Customer Order: orderId="${externalNumber}", error="${err.message}"`);
     if (err.stack) console.error(err.stack);
   }
   
-  const positions = mapPositionsFromYandex(notification);
+  // Восстанавливаем items из кэша
+  const cachedItems = orderItemsCache.get(externalNumber);
+  if (!cachedItems) {
+    console.error(`[PROCESSING] No cached items found: orderId="${externalNumber}"`);
+    throw new Error('No cached items found for order');
+  }
+  
+  // Создаём временный notification объект с items для маппинга
+  const notificationWithItems = { ...notification, items: cachedItems };
+  const positions = mapPositionsFromYandex(notificationWithItems);
 
   if (positions.length === 0) {
-    console.error(`[ORDER_CREATED] No mapped positions found: orderId="${externalNumber}"`);
+    console.error(`[PROCESSING] No mapped positions found: orderId="${externalNumber}"`);
     throw new Error('No mapped products found for order');
   }
   
-  console.log(`[ORDER_CREATED] Mapped positions: orderId="${externalNumber}", count=${positions.length}`);
+  console.log(`[PROCESSING] Mapped positions: orderId="${externalNumber}", count=${positions.length}`);
 
-  // Создаём customerorder — резерв в МойСклад
+  // Создаём Customer Order — резерв в МойСклад
   const co = await createCustomerOrder({
     externalNumber,
     storeId: STORE_ID,
@@ -178,34 +209,43 @@ async function handleOrderCreated(notification, externalNumber) {
     description: `Reserve for Yandex order ${externalNumber}`
   });
 
-  console.log(`[ORDER_CREATED] Success: orderId="${externalNumber}", entityId="${co.id || 'unknown'}"`);
+  console.log(`[PROCESSING] Customer Order created (reserve applied): orderId="${externalNumber}", entityId="${co.id || 'unknown'}"`);
   return { status: 200, message: 'reserved' };
 }
 
-// Handle label print event - create Demand (shipment)
-async function handleLabelPrint(notification, externalNumber) {
-  console.log(`[LABEL_PRINT] Processing order: orderId="${externalNumber}"`);
+// Handle PICKUP status - create Demand (shipment)
+async function handlePickup(notification, externalNumber) {
+  console.log(`[PICKUP] Processing order: orderId="${externalNumber}"`);
   
   // Check if Demand already exists (idempotency)
   try {
     const existingDemand = await findDemandByExternalNumber(externalNumber);
     if (existingDemand) {
-      console.log(`[LABEL_PRINT] Demand already exists: orderId="${externalNumber}", skipping creation`);
+      console.log(`[PICKUP] Demand already exists: orderId="${externalNumber}", skipping creation`);
       return { status: 200, message: 'already exists' };
     }
   } catch (err) {
-    console.error(`[LABEL_PRINT] Error checking existing Demand: orderId="${externalNumber}", error="${err.message}"`);
+    console.error(`[PICKUP] Error checking existing Demand: orderId="${externalNumber}", error="${err.message}"`);
     if (err.stack) console.error(err.stack);
   }
   
-  const positions = mapPositionsFromYandex(notification);
+  // Восстанавливаем items из кэша
+  const cachedItems = orderItemsCache.get(externalNumber);
+  if (!cachedItems) {
+    console.error(`[PICKUP] No cached items found: orderId="${externalNumber}"`);
+    throw new Error('No cached items found for order');
+  }
+  
+  // Создаём временный notification объект с items для маппинга
+  const notificationWithItems = { ...notification, items: cachedItems };
+  const positions = mapPositionsFromYandex(notificationWithItems);
   
   if (positions.length === 0) {
-    console.error(`[LABEL_PRINT] No mapped positions found: orderId="${externalNumber}"`);
+    console.error(`[PICKUP] No mapped positions found: orderId="${externalNumber}"`);
     throw new Error('No mapped products found for order');
   }
   
-  console.log(`[LABEL_PRINT] Mapped positions: orderId="${externalNumber}", count=${positions.length}`);
+  console.log(`[PICKUP] Mapped positions: orderId="${externalNumber}", count=${positions.length}`);
 
   const demand = await createDemand({
     externalNumber,
@@ -215,8 +255,57 @@ async function handleLabelPrint(notification, externalNumber) {
     description: `Shipment (demand) for Yandex order ${externalNumber}`
   });
 
-  console.log(`[LABEL_PRINT] Success: orderId="${externalNumber}", entityId="${demand.id || 'unknown'}"`);
+  console.log(`[PICKUP] Demand created (товар списан): orderId="${externalNumber}", entityId="${demand.id || 'unknown'}"`);
+  
+  // Очищаем кэш после успешной отгрузки
+  orderItemsCache.delete(externalNumber);
+  console.log(`[PICKUP] Cleared items cache: orderId="${externalNumber}"`);
+  
   return { status: 200, message: 'shipped' };
+}
+
+// Handle CANCELLED status - delete Customer Order (remove reserve)
+async function handleCancelled(notification, externalNumber) {
+  console.log(`[CANCELLED] Processing order: orderId="${externalNumber}"`);
+  
+  try {
+    // Ищем существующий Customer Order
+    const existingOrder = await findCustomerOrderByExternalNumber(externalNumber);
+    
+    if (!existingOrder) {
+      console.log(`[CANCELLED] Customer Order not found: orderId="${externalNumber}", nothing to delete`);
+      // Очищаем кэш на всякий случай
+      orderItemsCache.delete(externalNumber);
+      return { status: 200, message: 'not_found' };
+    }
+    
+    // Удаляем Customer Order (резерв автоматически снимется)
+    const deleteUrl = existingOrder.meta.href;
+    await axios.delete(deleteUrl, { headers: getAuthHeaders() });
+    
+    console.log(`[CANCELLED] Customer Order deleted (reserve removed): orderId="${externalNumber}", entityId="${existingOrder.id}"`);
+    
+    // Очищаем кэш
+    orderItemsCache.delete(externalNumber);
+    console.log(`[CANCELLED] Cleared items cache: orderId="${externalNumber}"`);
+    
+    return { status: 200, message: 'deleted' };
+    
+  } catch (err) {
+    console.error(`[CANCELLED] Error deleting Customer Order: orderId="${externalNumber}", error="${err.message}"`);
+    if (err.stack) console.error(err.stack);
+    throw err;
+  }
+}
+
+// Helper function to get auth headers (needed for axios.delete in handleCancelled)
+function getAuthHeaders() {
+  const token = process.env.MOYSKLAD_PASSWORD;
+  return {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/json;charset=utf-8',
+    'Content-Type': 'application/json'
+  };
 }
 
 app.post('/webhook', async (req, res) => {
@@ -271,15 +360,20 @@ app.post('/webhook', async (req, res) => {
       
       console.log(`[ORDER_STATUS_UPDATED] Processing order: orderId="${externalNumber}", newStatus="${newStatus}"`);
 
-      // Статусы, которые триггерят создание Отгрузки
-      // PROCESSING - Заказ в обработке (можно начинать сборку)
-      // DELIVERY - Заказ передан в доставку (готов к отгрузке)
-      // PICKUP - Заказ готов к выдаче (для самовывоза)
-      const triggerStatuses = ['PROCESSING', 'DELIVERY', 'PICKUP'];
-
-      if (triggerStatuses.includes(newStatus)) {
-        const result = await handleLabelPrint(event, externalNumber);
-      } else {
+      // PROCESSING - создаём Customer Order (резерв)
+      if (newStatus === 'PROCESSING') {
+        await handleProcessing(event, externalNumber);
+      }
+      // PICKUP или DELIVERED - создаём Demand (отгрузка)
+      // PICKUP = FBS самовывоз, DELIVERED = Экспресс доставка
+      else if (newStatus === 'PICKUP' || newStatus === 'DELIVERED') {
+        await handlePickup(event, externalNumber);
+      }
+      // CANCELLED - удаляем Customer Order (снимаем резерв)
+      else if (newStatus === 'CANCELLED') {
+        await handleCancelled(event, externalNumber);
+      }
+      else {
         console.log(`[ORDER_STATUS_UPDATED] Status ignored: orderId="${externalNumber}", status="${newStatus}"`);
       }
 
@@ -390,15 +484,20 @@ app.post('/notification', async (req, res) => {
       
       console.log(`[NOTIFICATION] ORDER_STATUS_UPDATED: orderId="${externalNumber}", newStatus="${newStatus}"`);
 
-      // Статусы, которые триггерят создание Отгрузки
-      // PROCESSING - Заказ в обработке (можно начинать сборку)
-      // DELIVERY - Заказ передан в доставку (готов к отгрузке)
-      // PICKUP - Заказ готов к выдаче (для самовывоза)
-      const triggerStatuses = ['PROCESSING', 'DELIVERY', 'PICKUP'];
-
-      if (triggerStatuses.includes(newStatus)) {
-        const result = await handleLabelPrint(event, externalNumber);
-      } else {
+      // PROCESSING - создаём Customer Order (резерв)
+      if (newStatus === 'PROCESSING') {
+        await handleProcessing(event, externalNumber);
+      }
+      // PICKUP или DELIVERED - создаём Demand (отгрузка)
+      // PICKUP = FBS самовывоз, DELIVERED = Экспресс доставка
+      else if (newStatus === 'PICKUP' || newStatus === 'DELIVERED') {
+        await handlePickup(event, externalNumber);
+      }
+      // CANCELLED - удаляем Customer Order (снимаем резерв)
+      else if (newStatus === 'CANCELLED') {
+        await handleCancelled(event, externalNumber);
+      }
+      else {
         console.log(`[NOTIFICATION] Status ignored: orderId="${externalNumber}", status="${newStatus}"`);
       }
 
